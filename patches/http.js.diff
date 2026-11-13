@@ -1,0 +1,59 @@
+--- a/http.js	2026-11-13 20:06:47
++++ b/http.js	2026-11-13 20:06:47
+@@ -24,7 +24,22 @@
+ 
+ import { CLIENT_UA, UPSTREAM_BASE, gatewayHeaders, truncateSession } from './upstream.js'
+ import { egressFetch } from './egress.js'
++import { officialBridgeAvailable, streamViaOfficial } from './official-bridge.js'
+ 
++/**
++ * Is this payload the free lane's client-identity gate?
++ *
++ * Upstream answers `FreeUsageLimitError` both for a genuinely spent quota and
++ * for a socket it does not recognise; the two are indistinguishable here, so
++ * the bridge is tried for either and a real quota exhaustion simply fails
++ * there too — the message the caller finally sees stays the same.
++ */
++function isFreeLimitGate(payload) {
++  const type = String(payload?.error?.type ?? payload?.type ?? '')
++  const message = String(payload?.error?.message ?? payload?.message ?? '')
++  return type === 'FreeUsageLimitError' || /free usage limit reached/i.test(message)
++}
++
+ /** Harness-neutral failure codes (packages/llm/llm/src/error.ts vocabulary; CLIENT_ERROR extends it like CONFIG_DISABLED does). */
+ export const CODE = {
+   region: 'REGION_BLOCKED',
+@@ -444,6 +459,33 @@
+     }
+     let payload
+     try { payload = JSON.parse(text) } catch { payload = { error: { message: text.slice(0, 300) || `HTTP ${response.status}` } } }
++
++    /**
++     * The free lane is gated on the TLS ClientHello, not on the request we send
++     * (measured 2026-11-13 — the fingerprints are recorded in
++     * src/official-bridge.js). A `FreeUsageLimitError` on *our* socket is
++     * therefore not something a retry can fix, and not a message the caller can
++     * act on. Hand the turn to the official client — whose socket upstream
++     * accepts — when one is installed.
++     *
++     * Tool-bearing turns are carried too, with the caveat the bridge documents:
++     * the official agent runs those tools itself and returns prose.
++     */
++    if (isFreeLimitGate(payload) && officialBridgeAvailable()) {
++      try {
++        const bridged = await streamViaOfficial({ body, signal, onData, timeoutMs })
++        return { status: 200, headers: new Headers({ 'x-our-free-model-transport': 'official-bridge' }), bridged }
++      } catch (bridgeError) {
++        // Falling through keeps the lane's own verdict: the bridge failing must
++        // not mask what upstream actually answered.
++        //
++        // This module has no logger (it is imported by the transport, not by a
++        // fiber), and an unguarded `logger.warn` in a catch would throw a
++        // ReferenceError that hides the real failure — stderr is the channel
++        // that exists here.
++        process.stderr.write(`our-free-model: official bridge could not carry the turn (${bridgeError?.message ?? bridgeError})\n`)
++      }
++    }
+     throw classifyFailure(response.status, payload, setRetry)
+   }
+   if (response.body === null) throw new UpstreamError('our-free-model: upstream returned no body', CODE.empty)
