@@ -34,8 +34,8 @@
  */
 
 import { spawn } from 'node:child_process'
-import { existsSync, statSync, accessSync, constants } from 'node:fs'
-import { homedir } from 'node:os'
+import { existsSync, statSync, accessSync, constants, mkdtempSync, writeFileSync } from 'node:fs'
+import { homedir, tmpdir } from 'node:os'
 import { delimiter, join } from 'node:path'
 
 /** Ordered candidates; first existing executable wins. Override with `OUR_FREE_MODEL_OFFICIAL_BIN`. */
@@ -103,6 +103,46 @@ const MIN_TIMEOUT_MS = 30_000
 const DEFAULT_TIMEOUT_MS = 600_000
 
 /**
+ * The permission set a bridged run gets: read the workspace, nothing else.
+ *
+ * `external_directory` is allowed on purpose. The official client treats any
+ * path outside its own cwd as "external" and asks before reading it — and an
+ * ask in non-interactive mode is auto-rejected, which is the exact failure this
+ * whole mechanism exists to avoid. Denying reads there would resurrect it for
+ * any prompt that names an absolute path, which agent prompts do constantly.
+ * The file still cannot be written, and shell stays denied, so "read anything,
+ * change nothing" is the honest description of what this grants.
+ */
+const BRIDGE_PERMISSIONS = {
+  read: 'allow',
+  list: 'allow',
+  glob: 'allow',
+  grep: 'allow',
+  external_directory: 'allow',
+  bash: 'deny',
+  edit: 'deny',
+  write: 'deny',
+}
+
+/** One config file per process, written on first use; `undefined` means "let the binary use its own". */
+let bridgeConfigPath
+function writeBridgeConfig() {
+  if (bridgeConfigPath !== undefined) return bridgeConfigPath
+  try {
+    const dir = mkdtempSync(join(tmpdir(), 'ofm-bridge-'))
+    const file = join(dir, 'opencode.json')
+    writeFileSync(file, JSON.stringify({ $schema: 'https://opencode.ai/config.json', permission: BRIDGE_PERMISSIONS }, null, 2))
+    bridgeConfigPath = file
+    return file
+  } catch {
+    // No temp dir (a locked-down box): fall back to the binary's own config. A
+    // turn that then needs a tool fails loudly as "produced no text" rather than
+    // silently pretending to have answered.
+    return undefined
+  }
+}
+
+/**
  * Run one text turn through the official client and stream it back as SSE.
  *
  * The returned frames use the same `data: {chunk}` shape the free lane's own
@@ -144,9 +184,31 @@ export async function streamViaOfficial({ body, signal, onData, binary, timeoutM
   const args = ['run', '--format', 'json', '--model', `opencode/${model}`, prompt]
   const budget = Math.max(MIN_TIMEOUT_MS, Math.min(Number.isFinite(timeoutMs) ? timeoutMs : DEFAULT_TIMEOUT_MS, DEFAULT_TIMEOUT_MS))
 
+  // Tool permissions are what make an agent-style turn survive this transport.
+  //
+  // Measured 2026-11-13 (the failure that looked like "the fix stopped working"):
+  // the official CLI auto-rejects a permission request in non-interactive mode
+  // and then **ends the run without emitting a single `text` event** — the turn
+  // arrives here as exit code 0 with zero text, which this module reported as
+  // `the official client produced no text` and the caller then surfaced as the
+  // lane's own 429. A DSH agent turn always declares tools, so the official
+  // agent reliably reaches for one (reading a file its prompt named), and every
+  // such turn died the same way.
+  //
+  // Allowing **read-only** tools fixes exactly that: the official agent performs
+  // the read itself and then writes the answer as text, which is the whole
+  // contract of this transport. Writes and shell stay denied — a bridged turn
+  // must not be able to change the machine on behalf of a caller that never saw
+  // the tool call (see `toolsRunUpstream` above), and nothing this bridge offers
+  // needs them.
+  //
+  // The permission set is passed through a dedicated config file rather than the
+  // user's own `~/.config/opencode`: this is the bridge's contract with the
+  // binary, not a change to how the user's own opencode install behaves.
+  const configPath = writeBridgeConfig()
   const child = spawn(executable, args, {
     stdio: ['ignore', 'pipe', 'pipe'],
-    env: { ...process.env, OPENCODE_DISABLE_TELEMETRY: '1' },
+    env: { ...process.env, OPENCODE_DISABLE_TELEMETRY: '1', ...(configPath === undefined ? {} : { OPENCODE_CONFIG: configPath }) },
   })
 
   let killedForTimeout = false

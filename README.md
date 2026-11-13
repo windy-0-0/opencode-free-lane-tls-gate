@@ -47,6 +47,17 @@ opencode.ai 的匿名免费通道在 2026-11 期间加了一道**客户端身份
 - 那些命令**没有经过你自己的审批、沙箱或审计**；
 - 你的对话内容会经过官方 client 的完整 agent 流程（它会注入自己的系统提示与工具集）。
 
+**本仓库的桥把这份授权收窄到只读**：`read / list / glob / grep / external_directory` 放行，
+`bash / edit / write` 一律拒绝 —— 官方 agent **可以读、不能改、不能起 shell**。
+这是一份独立的临时配置（经 `OPENCODE_CONFIG` 传给子进程），
+**不会改动你自己 `~/.config/opencode` 的任何设置**。
+
+> **这个收窄不是可选的礼貌，缺了它整条路就是死的。** 早期版本没给权限配置，
+> 官方 CLI 在非交互模式会把「需要授权」**自动拒绝**，然后**那一轮直接结束、不产出任何正文**。
+> 表面现象是桥报 `produced no text`、上层最终回显上游那句 429 —— 看起来像「补丁失效了」，
+> 实际是官方 agent 想去读文件、被它自己的权限系统挡住了。**任何 agent 类回合（带 tools 的）
+> 都会稳定踩到**，而这类回合恰恰是最常见的形态。详见下方「实测记录」最后一节。
+
 如果这不可接受，请**不要启用**这一路径（本文档附带的代码是可选回退，正常直连优先）。
 
 ### 5. 不要用它做这些事
@@ -105,7 +116,7 @@ tests/official-bridge.test.mjs 离线回归（9 项，不依赖网络）
    （补丁已实测：在 2.8.0 原版上应用后与验证过的成品**逐字节一致**）。
 4. 确保机器上装有官方 `opencode` 可执行文件；否则用
    `OUR_FREE_MODEL_OFFICIAL_BIN=/path/to/opencode` 指定。
-5. 运行 `node tests/official-bridge.test.mjs`，应显示 `9 checks passed`。
+5. 运行 `node tests/official-bridge.test.mjs`，应显示 `10 checks passed`。
 
 改动行为：**正常直连优先**，只有收到 `FreeUsageLimitError` 且本机有官方二进制时才走桥接；
 桥接失败会回落到原始错误，不掩盖上游的回应。
@@ -116,12 +127,45 @@ tests/official-bridge.test.mjs 离线回归（9 项，不依赖网络）
 
 ```
 transport: official-bridge
-单轮 8.5s 出字                       ✅
-多轮上下文保留（7391 → 7391）         ✅
-带 13 工具的 DSH 真实回合 7.0s        ✅（工具由官方 agent 执行）
-连续 3 次 5.1~10.3s，usage 帧正常     ✅
-离线回归 9/9                          ✅
+单轮 8.5s 出字                                    ✅
+多轮上下文保留（7391 → 7391）                      ✅
+带 13 工具的 DSH 真实回合 7.0s                     ✅（工具由官方 agent 执行）
+连续 3 次 5.1~10.3s，usage 帧正常                  ✅
+离线回归 10/10                                     ✅
 ```
+
+### 补记：第一版「看起来修好了」，其实只测了最不容易踩坑的那一类回合
+
+第一版上线后，用户重启，仍然报同一句 `Free usage limit reached`。**不是 TLS 反复，也不是没生效**：
+
+| 检查 | 读数 | 说明 |
+|---|---|---|
+| 包安装时刻 vs 进程启动 | 19:57 → **20:01** | 进程在装机之后，排除「磁盘修好、内存没换」 |
+| 单独调桥 | **6.0s 出字** | 排除 TLS 与二进制路径 |
+| 宿主 stderr | `official bridge could not carry the turn (the official client produced no text)` | 桥**跑了**，但零正文 |
+
+手工跑同一条命令，事件流是这样结束的：
+
+```
+step_start
+→ permission requested: external_directory (/etc/*); auto-rejecting
+→ tool_use(read, state.error="The user rejected permission ...")
+→ step_finish(reason=tool-calls)      ← 进程到此结束，一个 text 都没有
+```
+
+**根因**：非交互模式下，官方 CLI 会把「需要授权」自动拒绝，然后**这一轮直接结束**。
+而 agent 类回合（带 tools、提示词里提到文件路径）几乎必然触发它 —— 第一版只验证了
+「纯文本回合」，于是拿到了一整片**假绿**。
+
+**修法**：给子进程一份只读权限配置（见上文「能力降级」）。
+`external_directory` 必须放行 —— 官方把 cwd 之外的任何路径都判为「外部」并询问，
+而询问在非交互下就是拒绝，这是同一故障的**第二个入口**。
+
+修后同一场景实测：**200 / `x-our-free-model-transport: official-bridge` / 178 字符正文**，
+且事件流里能看到 `tool_use(read, completed)` —— 官方 agent 确实读到了文件再作答。
+
+回归用例也补了一条：用一个假二进制把 `OPENCODE_CONFIG` 抄出来，逐项断言
+`read=allow`、`external_directory=allow`、`bash|edit|write=deny` —— 以后谁"顺手收紧权限"，这条会先红。
 
 ---
 

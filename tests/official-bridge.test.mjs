@@ -10,7 +10,7 @@
 import assert from 'node:assert/strict'
 import { fileURLToPath } from 'node:url'
 import { dirname, join } from 'node:path'
-import { chmodSync, mkdtempSync, writeFileSync } from 'node:fs'
+import { chmodSync, mkdtempSync, writeFileSync, readFileSync } from 'node:fs'
 import { tmpdir } from 'node:os'
 
 const here = dirname(fileURLToPath(import.meta.url))
@@ -97,6 +97,30 @@ check('an empty conversation is refused before a process is spawned', async () =
     () => streamViaOfficial({ body: { model: 'm', messages: [] }, onData: () => {}, binary: fake }),
     /at least one non-empty message/,
   )
+})
+
+check('a bridged run is handed a read-only permission set', async () => {
+  // Regression for the 2026-11-13 failure that read as "the fix stopped working":
+  // without an allow, the official CLI auto-rejects its own permission request in
+  // non-interactive mode and ends the run with zero `text` events, which surfaced
+  // to the caller as the lane's own 429. The config the module hands the child is
+  // the only place that decision is observable offline.
+  const dir = mkdtempSync(join(tmpdir(), 'ofm-bridge-'))
+  const fake = join(dir, 'opencode')
+  const envDump = join(dir, 'config.json')
+  // Copy the config the bridge pointed the child at, then exit without text.
+  writeFileSync(fake, `#!/bin/sh\ncp "$OPENCODE_CONFIG" "${envDump}" 2>/dev/null\nexit 0\n`)
+  chmodSync(fake, 0o755)
+  await assert.rejects(
+    () => streamViaOfficial({ body: { model: 'm', messages: [{ role: 'user', content: 'x' }] }, onData: () => {}, binary: fake }),
+    /produced no text/,
+  )
+  const config = JSON.parse(readFileSync(envDump, 'utf8'))
+  assert.equal(config.permission.read, 'allow', 'the official agent must be able to read, or every agent turn dies')
+  assert.equal(config.permission.external_directory, 'allow', 'an absolute-path prompt would otherwise die the same way')
+  assert.equal(config.permission.bash, 'deny', 'a bridged turn must not get a shell')
+  assert.equal(config.permission.edit, 'deny', 'a bridged turn must not write files')
+  assert.equal(config.permission.write, 'deny')
 })
 
 console.log(`\n${passed} checks passed`)
